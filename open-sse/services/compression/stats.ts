@@ -153,7 +153,8 @@ export function createCompressionStats(
   mode: CompressionMode,
   techniquesUsed: string[],
   rulesApplied?: string[],
-  durationMs?: number
+  durationMs?: number,
+  validationWarnings?: string[]
 ): CompressionStats {
   const originalTokens = estimateCompressionTokens(originalBody);
   const compressedTokens = estimateCompressionTokens(compressedBody);
@@ -170,6 +171,7 @@ export function createCompressionStats(
     timestamp: Date.now(),
     ...(rulesApplied && rulesApplied.length > 0 ? { rulesApplied } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(validationWarnings && validationWarnings.length > 0 ? { validationWarnings } : {}),
   };
 }
 

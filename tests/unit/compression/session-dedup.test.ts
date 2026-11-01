@@ -112,7 +112,9 @@ describe("session-dedup engine", () => {
     const hugeLines: string[] = [];
     for (let i = 0; i < 6000; i++) {
       // ~80 chars/line so each suffix is large — the pathological shape.
-      hugeLines.push(`${i}:               "config_snapshot": { "value": ${i}, "pad": "xxxxxxxxxxxxxx" }`);
+      hugeLines.push(
+        `${i}:               "config_snapshot": { "value": ${i}, "pad": "xxxxxxxxxxxxxx" }`
+      );
     }
     const hugeContent = hugeLines.join("\n");
     const body = makeBody([
@@ -138,6 +140,33 @@ describe("session-dedup engine", () => {
     );
     // Result must still be a valid body (engine did not throw / corrupt).
     assert.ok(Array.isArray((result.body as Record<string, unknown>).messages));
+  });
+
+  it("budget cap: a line-rich single message is bounded by the shared two-pass budget", () => {
+    // 3000 lines so that findSuffixBlocks scans MAX_SUFFIX_STARTS (2000)
+    // suffixes; the cumulative retained block bytes exceed the 32 MiB budget.
+    const lines: string[] = [];
+    for (let i = 0; i < 3000; i++) {
+      lines.push(`line-${i.toString().padStart(4, "0")}: ${"x".repeat(80)}`);
+    }
+    const body = makeBody([{ role: "user", content: lines.join("\n") }]);
+
+    const result = sessionDedupEngine.apply(body as Record<string, unknown>);
+
+    // Budget cap active: the engine must return explanatory stats (not null),
+    // must not compress, and must never OOM.
+    assert.ok(result.stats !== null, "stats must be present");
+    assert.ok(
+      result.stats!.validationWarnings.includes(
+        "session-dedup: skipped (suffix work budget exceeded)"
+      ),
+      `validationWarnings=${JSON.stringify(result.stats!.validationWarnings)}`
+    );
+    assert.equal(result.compressed, false, "must not compress when budget exceeded");
+    assert.ok(
+      result.stats!.originalTokens === result.stats!.compressedTokens,
+      "zero savings when the budget is exceeded"
+    );
   });
 
   it("never deduplicates the system prompt", () => {
