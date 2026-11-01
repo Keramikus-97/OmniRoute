@@ -59,7 +59,19 @@ const MIN_BLOCK_LINES = 3;
  * changes output correctness.
  */
 const MAX_SUFFIX_STARTS = 2000;
-const MAX_TOTAL_BLOCK_BYTES = 8 * 1024 * 1024;
+/** Shared-suffix-block work budget (bytes). Matches the test's 32 MiB budget
+ * (tests/unit/compression/session-dedup-memory-7849.test.ts). Still a hard
+ * cap on retained block bytes, so a single agent-turn cannot OOM. */
+const MAX_TOTAL_BLOCK_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Warning emitted when the shared two-pass suffix-block scan is bounded by the
+ * work budget (see MAX_SUFFIX_STARTS / MAX_TOTAL_BLOCK_BYTES). The engine
+ * returns `stats` (non-null) with this validation warning instead of `null` so
+ * the stacked pipeline can distinguish "no eligible content" from "budget
+ * exceeded".
+ */
+const SUFFIX_WORK_BUDGET_WARNING = "session-dedup: skipped (suffix work budget exceeded)";
 
 // ─── hash helper (SHA-256 prefix, collision-resistant) ───────────────────────
 
@@ -84,7 +96,7 @@ function hashBlock(text: string): string {
 function findSuffixBlocks(
   lines: string[],
   minBlockChars: number
-): Array<{ block: string; startLine: number }> {
+): { blocks: Array<{ block: string; startLine: number }>; budgetExceeded: boolean } {
   const n = lines.length;
   const seen = new Set<string>();
   const results: Array<{ block: string; startLine: number }> = [];
@@ -94,6 +106,7 @@ function findSuffixBlocks(
   // suffix strings at once. See MAX_SUFFIX_STARTS / MAX_TOTAL_BLOCK_BYTES.
   const maxStarts = Math.min(n, MAX_SUFFIX_STARTS);
   let totalBlockBytes = 0;
+  let budgetExceeded = false;
   for (let start = 0; start < maxStarts; start++) {
     const block = lines.slice(start).join("\n");
     const blockLines = n - start;
@@ -101,10 +114,13 @@ function findSuffixBlocks(
       seen.add(block);
       results.push({ block, startLine: start });
       totalBlockBytes += block.length;
-      if (totalBlockBytes >= MAX_TOTAL_BLOCK_BYTES) break;
+      if (totalBlockBytes >= MAX_TOTAL_BLOCK_BYTES) {
+        budgetExceeded = true;
+        break;
+      }
     }
   }
-  return results;
+  return { blocks: results, budgetExceeded };
 }
 
 // ─── two-pass dedup on message texts ─────────────────────────────────────────
@@ -116,11 +132,11 @@ function findSuffixBlocks(
 function dedupeWithinMessage(
   text: string,
   minBlockChars: number
-): { deduped: string; changed: boolean } {
+): { deduped: string; changed: boolean; budgetExceeded: boolean } {
   const lines = text.split("\n");
-  const blocks = findSuffixBlocks(lines, minBlockChars);
+  const { blocks, budgetExceeded } = findSuffixBlocks(lines, minBlockChars);
 
-  if (blocks.length < 2) return { deduped: text, changed: false };
+  if (blocks.length < 2) return { deduped: text, changed: false, budgetExceeded };
 
   // Find the most common block (likely candidate for intra-message dedup).
   const blockFreq = new Map<string, number>();
@@ -139,7 +155,9 @@ function dedupeWithinMessage(
 
   for (const { block } of sortedBlocks) {
     // Only dedup blocks that appear 2+ times in the text.
-    const occurrences = (result.match(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
+    const occurrences = (
+      result.match(new RegExp(block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []
+    ).length;
     if (occurrences < 2) continue;
 
     const sha = hashBlock(block);
@@ -153,7 +171,7 @@ function dedupeWithinMessage(
     changed = true;
   }
 
-  return { deduped: result, changed };
+  return { deduped: result, changed, budgetExceeded };
 }
 
 /**
@@ -166,41 +184,67 @@ function dedupMessageTexts(
 ): {
   deduped: Map<number, string>;
   dedupCount: number;
+  budgetExceeded: boolean;
 } {
   const deduped = new Map<number, string>();
   let dedupCount = 0;
+  let budgetExceeded = false;
 
   // Single-message case: apply intra-message dedup.
   if (msgTexts.length === 1) {
     const { text, msgIdx } = msgTexts[0];
-    const { deduped: dedupedText, changed } = dedupeWithinMessage(text, minBlockChars);
+    const {
+      deduped: dedupedText,
+      changed,
+      budgetExceeded: be,
+    } = dedupeWithinMessage(text, minBlockChars);
     if (changed) {
       deduped.set(msgIdx, dedupedText);
       dedupCount++;
     }
-    return { deduped, dedupCount };
+    budgetExceeded = budgetExceeded || be;
+    return { deduped, dedupCount, budgetExceeded };
   }
 
   // Multi-message case: apply cross-turn dedup.
   // Pass 1: for each message, extract suffix blocks and record first ownership.
   // `firstSeen`: sha → { ownerMsgIdx, block }
   const firstSeen = new Map<string, { ownerMsgIdx: number; block: string }>();
+  // Cumulative budget: the two-pass suffix-block scan is shared across all
+  // messages, so the retained block bytes are charged against a single budget.
+  let totalBlockBytes = 0;
 
   for (const { msgIdx, text } of msgTexts) {
     const lines = text.split("\n");
-    const blocks = findSuffixBlocks(lines, minBlockChars);
+    const { blocks, budgetExceeded: be } = findSuffixBlocks(lines, minBlockChars);
+    budgetExceeded = budgetExceeded || be;
     for (const { block } of blocks) {
+      totalBlockBytes += block.length;
+      if (totalBlockBytes >= MAX_TOTAL_BLOCK_BYTES) {
+        budgetExceeded = true;
+        break;
+      }
       const sha = hashBlock(block);
       if (!firstSeen.has(sha)) {
         firstSeen.set(sha, { ownerMsgIdx: msgIdx, block });
       }
     }
+    if (budgetExceeded) break;
   }
 
   // Pass 2: for each message, find blocks that were FIRST seen in an earlier message.
   for (const { msgIdx, text } of msgTexts) {
     const lines = text.split("\n");
-    const blocks = findSuffixBlocks(lines, minBlockChars);
+    const { blocks, budgetExceeded: be } = findSuffixBlocks(lines, minBlockChars);
+    budgetExceeded = budgetExceeded || be;
+    for (const { block } of blocks) {
+      totalBlockBytes += block.length;
+      if (totalBlockBytes >= MAX_TOTAL_BLOCK_BYTES) {
+        budgetExceeded = true;
+        break;
+      }
+    }
+    if (budgetExceeded) break;
 
     // Collect blocks that are duplicates (owned by an earlier message).
     const dupBlocks: Array<{ block: string; sha: string }> = [];
@@ -244,7 +288,7 @@ function dedupMessageTexts(
     }
   }
 
-  return { deduped, dedupCount };
+  return { deduped, dedupCount, budgetExceeded };
 }
 
 // ─── message array processing ─────────────────────────────────────────────────
@@ -261,7 +305,7 @@ type MessageLike = {
 function processMessages(
   messages: MessageLike[],
   minBlockChars: number
-): { messages: MessageLike[]; dedupCount: number } {
+): { messages: MessageLike[]; dedupCount: number; budgetExceeded: boolean } {
   // Collect (msgIdx, text) for non-system string-content messages.
   // For multipart, index each text part separately.
   const msgTexts: Array<{ msgIdx: number; text: string }> = [];
@@ -283,13 +327,13 @@ function processMessages(
   }
 
   if (msgTexts.length === 0) {
-    return { messages, dedupCount: 0 };
+    return { messages, dedupCount: 0, budgetExceeded: false };
   }
 
-  const { deduped, dedupCount } = dedupMessageTexts(msgTexts, minBlockChars);
+  const { deduped, dedupCount, budgetExceeded } = dedupMessageTexts(msgTexts, minBlockChars);
 
   if (dedupCount === 0) {
-    return { messages, dedupCount: 0 };
+    return { messages, dedupCount: 0, budgetExceeded };
   }
 
   const result = messages.map((msg, i) => {
@@ -318,7 +362,7 @@ function processMessages(
     return { ...msg };
   });
 
-  return { messages: result, dedupCount };
+  return { messages: result, dedupCount, budgetExceeded };
 }
 
 // ─── schema & validation ──────────────────────────────────────────────────────
@@ -364,7 +408,8 @@ function validateSessionDedupConfig(config: Record<string, unknown>): EngineVali
     const f = config["fuzzy"];
     if (typeof f === "object" && f !== null) {
       const fe = (f as Record<string, unknown>)["enabled"];
-      if (fe !== undefined && typeof fe !== "boolean") errors.push("fuzzy.enabled must be a boolean");
+      if (fe !== undefined && typeof fe !== "boolean")
+        errors.push("fuzzy.enabled must be a boolean");
     } else if (typeof f !== "boolean") {
       errors.push("fuzzy must be an object { enabled } or a boolean");
     }
@@ -415,10 +460,11 @@ export const sessionDedupEngine: CompressionEngine = {
     }
 
     const start = performance.now();
-    const { messages: exactMessages, dedupCount } = processMessages(
-      messages as MessageLike[],
-      minBlockChars
-    );
+    const {
+      messages: exactMessages,
+      dedupCount,
+      budgetExceeded,
+    } = processMessages(messages as MessageLike[], minBlockChars);
 
     const { messages: finalMessages, fuzzyCount } = runFuzzyPass(
       exactMessages,
@@ -428,6 +474,12 @@ export const sessionDedupEngine: CompressionEngine = {
     );
 
     if (dedupCount + fuzzyCount === 0) {
+      if (budgetExceeded) {
+        const stats = createCompressionStats(body, body, "stacked", ["session-dedup"], [], 0, [
+          SUFFIX_WORK_BUDGET_WARNING,
+        ]);
+        return { body, compressed: false, stats };
+      }
       return { body, compressed: false, stats: null };
     }
 
